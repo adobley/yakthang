@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,6 +16,52 @@ import (
 	"github.com/mrdavidlaing/yakthang/src/yak-box/internal/zellij"
 	"github.com/mrdavidlaing/yakthang/src/yak-box/pkg/types"
 )
+
+// zellijEnv returns the environment for a `zellij` subprocess with TMPDIR
+// corrected on macOS, or nil to inherit the parent env unchanged.
+//
+// Why: `zellij action` (new-tab, close-tab, query-tab-names) locates the
+// running session's server socket under $TMPDIR. Agent harnesses such as
+// Claude Code override TMPDIR for their tool subprocesses (e.g.
+// /tmp/claude-501), but the zellij server socket lives under the real macOS
+// per-user temp dir (getconf DARWIN_USER_TEMP_DIR → /var/folders/.../T/...).
+// With the overridden value, zellij looks in the wrong place and fails with
+// the opaque "There is no active session!" even though the session is alive.
+// Pointing TMPDIR at the canonical dir makes spawn/stop work regardless of
+// how yak-box was invoked. No-op on non-Darwin, where the inherited TMPDIR
+// is already correct.
+func zellijEnv() []string {
+	if goruntime.GOOS != "darwin" {
+		return nil
+	}
+	out, err := exec.Command("getconf", "DARWIN_USER_TEMP_DIR").Output()
+	if err != nil {
+		return nil
+	}
+	tmp := strings.TrimSpace(string(out))
+	if tmp == "" {
+		return nil
+	}
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "TMPDIR=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "TMPDIR="+tmp)
+}
+
+// zellijCommand builds an `exec.Cmd` for the zellij binary with TMPDIR
+// corrected (see zellijEnv). Use this for every zellij invocation so spawn
+// and stop behave identically regardless of the caller's TMPDIR.
+func zellijCommand(args ...string) *exec.Cmd {
+	cmd := exec.Command("zellij", args...)
+	if env := zellijEnv(); env != nil {
+		cmd.Env = env
+	}
+	return cmd
+}
 
 // SpawnNativeWorker spawns a worker in a Zellij session on the host.
 // Returns the path to the PID file so callers can store it in the session for cleanup.
@@ -54,9 +101,9 @@ func SpawnNativeWorker(worker *types.Worker, prompt string, homeDir string) (pid
 	zellijSession := worker.SessionName
 	var zellijCmd *exec.Cmd
 	if zellijSession != "" {
-		zellijCmd = exec.Command("zellij", "--session", zellijSession, "action", "new-tab", "--layout", layoutFile, "--name", worker.DisplayName, "--cwd", worker.CWD)
+		zellijCmd = zellijCommand("--session", zellijSession, "action", "new-tab", "--layout", layoutFile, "--name", worker.DisplayName, "--cwd", worker.CWD)
 	} else {
-		zellijCmd = exec.Command("zellij", "action", "new-tab", "--layout", layoutFile, "--name", worker.DisplayName, "--cwd", worker.CWD)
+		zellijCmd = zellijCommand("action", "new-tab", "--layout", layoutFile, "--name", worker.DisplayName, "--cwd", worker.CWD)
 	}
 
 	output, err := zellijCmd.CombinedOutput()
@@ -83,6 +130,11 @@ func StopNativeWorker(name, sessionName string) error {
 		} else {
 			cmd = exec.Command(closeTabScript, name)
 		}
+		// The script shells out to `zellij action`, so it needs the same
+		// TMPDIR correction (see zellijEnv).
+		if env := zellijEnv(); env != nil {
+			cmd.Env = env
+		}
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to close zellij tab via script: %w", err)
 		}
@@ -99,11 +151,11 @@ func StopNativeWorker(name, sessionName string) error {
 
 	var goCmd, closeCmd *exec.Cmd
 	if sessionName != "" {
-		goCmd = exec.Command("zellij", "--session", sessionName, "action", "go-to-tab", fmt.Sprintf("%d", tabIndex))
-		closeCmd = exec.Command("zellij", "--session", sessionName, "action", "close-tab")
+		goCmd = zellijCommand("--session", sessionName, "action", "go-to-tab", fmt.Sprintf("%d", tabIndex))
+		closeCmd = zellijCommand("--session", sessionName, "action", "close-tab")
 	} else {
-		goCmd = exec.Command("zellij", "action", "go-to-tab", fmt.Sprintf("%d", tabIndex))
-		closeCmd = exec.Command("zellij", "action", "close-tab")
+		goCmd = zellijCommand("action", "go-to-tab", fmt.Sprintf("%d", tabIndex))
+		closeCmd = zellijCommand("action", "close-tab")
 	}
 
 	if err := goCmd.Run(); err != nil {
@@ -122,9 +174,9 @@ func StopNativeWorker(name, sessionName string) error {
 func findZellijTabIndex(name, sessionName string) (int, error) {
 	var queryCmd *exec.Cmd
 	if sessionName != "" {
-		queryCmd = exec.Command("zellij", "--session", sessionName, "action", "query-tab-names")
+		queryCmd = zellijCommand("--session", sessionName, "action", "query-tab-names")
 	} else {
-		queryCmd = exec.Command("zellij", "action", "query-tab-names")
+		queryCmd = zellijCommand("action", "query-tab-names")
 	}
 
 	output, err := queryCmd.Output()
