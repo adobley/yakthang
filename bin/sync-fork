@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# sync-fork — bring this fork up to date with upstream while keeping our patches.
+#
+# Structure this assumes (see also the project README / fork setup):
+#   upstream  → wellmaintained/yakthang   (David's repo; we pull from here)
+#   origin    → adobley/yakthang          (our fork; we push here)
+#   main      → pristine mirror of upstream/main (never commit here directly)
+#   aidan     → our long-lived patch branch, rebased onto main each sync
+#
+# What it does:
+#   1. fetch upstream
+#   2. fast-forward main to upstream/main (fails loudly if main has diverged)
+#   3. push the updated main to our fork
+#   4. rebase our patch branch onto the fresh main
+#   5. force-push (with lease) the patch branch to our fork
+#   6. rebuild + reinstall the yak-box binary if its source changed
+#
+# Rebase (not merge) keeps the patch branch a clean stack of just our changes;
+# if upstream has absorbed one of our patches, the rebase drops it for free.
+
+set -euo pipefail
+
+PATCH_BRANCH="${PATCH_BRANCH:-aidan}"
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
+ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+say() { printf '\n\033[1;33m▸ %s\033[0m\n' "$*"; }
+die() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# --- preflight -------------------------------------------------------------
+
+git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 \
+  || die "no '$UPSTREAM_REMOTE' remote. Expected it to point at wellmaintained/yakthang."
+git remote get-url "$ORIGIN_REMOTE" >/dev/null 2>&1 \
+  || die "no '$ORIGIN_REMOTE' remote. Expected it to point at your fork."
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "working tree has uncommitted changes. Commit, stash, or discard them first.
+    (tip: a dirty submodule pointer like 'src/yaks' can be reset with: git checkout src/yaks)"
+fi
+
+START_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+# --- 1. fetch upstream -----------------------------------------------------
+
+say "Fetching $UPSTREAM_REMOTE…"
+git fetch "$UPSTREAM_REMOTE"
+
+# --- 2. fast-forward main to upstream/main ---------------------------------
+
+say "Fast-forwarding $MAIN_BRANCH to $UPSTREAM_REMOTE/$MAIN_BRANCH…"
+git checkout "$MAIN_BRANCH"
+if ! git merge --ff-only "$UPSTREAM_REMOTE/$MAIN_BRANCH"; then
+  die "$MAIN_BRANCH can't fast-forward — it has diverged from $UPSTREAM_REMOTE/$MAIN_BRANCH.
+    That means something was committed to $MAIN_BRANCH directly. Move those commits to
+    '$PATCH_BRANCH' and reset $MAIN_BRANCH: git reset --hard $UPSTREAM_REMOTE/$MAIN_BRANCH"
+fi
+
+# --- 3. push updated main to the fork --------------------------------------
+
+say "Pushing $MAIN_BRANCH to $ORIGIN_REMOTE…"
+git push "$ORIGIN_REMOTE" "$MAIN_BRANCH"
+
+# --- 4. rebase the patch branch onto fresh main ----------------------------
+
+say "Rebasing $PATCH_BRANCH onto $MAIN_BRANCH…"
+git checkout "$PATCH_BRANCH"
+if ! git rebase "$MAIN_BRANCH"; then
+  cat >&2 <<EOF
+
+✗ Rebase hit a conflict. Resolve it, then:
+    git add <files> && git rebase --continue
+  (or 'git rebase --abort' to bail). Re-run sync-fork afterward, or finish
+  the remaining steps by hand:
+    git push --force-with-lease $ORIGIN_REMOTE $PATCH_BRANCH
+EOF
+  exit 1
+fi
+
+# --- 5. force-push the patch branch (safe: it's ours) ----------------------
+
+say "Force-pushing $PATCH_BRANCH to $ORIGIN_REMOTE (with lease)…"
+git push --force-with-lease "$ORIGIN_REMOTE" "$PATCH_BRANCH"
+
+# --- 6. rebuild yak-box if its source changed ------------------------------
+
+# Rebuild when the rebase moved HEAD across any yak-box source, or always if we
+# can't tell. Cheap enough to just rebuild; skip only if go is missing.
+if command -v go >/dev/null 2>&1 && [ -d src/yak-box ]; then
+  say "Rebuilding yak-box → ~/.local/bin/yak-box…"
+  ( cd src/yak-box \
+    && go build -ldflags "-X main.version=$(git describe --tags --always --dirty)" \
+         -o "$HOME/.local/bin/yak-box" . ) \
+    && echo "  installed: $("$HOME/.local/bin/yak-box" --version 2>/dev/null || echo '?')"
+else
+  say "Skipping yak-box rebuild (go not found or src/yak-box missing)."
+fi
+
+# --- done ------------------------------------------------------------------
+
+say "Synced. $MAIN_BRANCH mirrors $UPSTREAM_REMOTE/$MAIN_BRANCH; $PATCH_BRANCH rebased on top."
+echo "  Your patches on $PATCH_BRANCH:"
+git --no-pager log --oneline "$MAIN_BRANCH..$PATCH_BRANCH" | sed 's/^/    /'
+
+# Leave the user on the patch branch (their working branch), unless they
+# started on main.
+if [ "$START_BRANCH" = "$MAIN_BRANCH" ]; then
+  git checkout "$MAIN_BRANCH"
+fi
